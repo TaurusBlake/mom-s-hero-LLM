@@ -11,7 +11,8 @@ from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import MessageEvent, TextMessageContent, AudioMessageContent, ImageMessageContent
+from linebot.v3.messaging.api import MessagingApiBlob
 
 # --- 資料庫模組 ---
 from database.models import init_db, save_recipe, Recipe, get_recipe_count
@@ -27,6 +28,12 @@ from offline_recipes import (
     format_offline_recipe_details
 )
 
+# --- 語音處理模組 ---
+from speech_processor import init_speech_processor, get_speech_processor
+
+# --- 圖片處理模組 ---
+from image_processor import init_image_processor, get_image_processor
+
 # --- 載入環境變數 ---
 load_dotenv()
 
@@ -37,6 +44,8 @@ app = Flask(__name__)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
 
 # --- 設定日誌 ---
 logging.basicConfig(
@@ -67,6 +76,32 @@ try:
 except Exception as e:
     print(f"LLM 初始化失敗: {e}")
     LLM_AVAILABLE = False
+
+# --- 初始化 Azure Speech Service ---
+try:
+    if AZURE_SPEECH_KEY and AZURE_SPEECH_REGION:
+        init_speech_processor(AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+        SPEECH_AVAILABLE = True
+        print("Azure Speech Service 初始化成功！")
+    else:
+        print("未設定 Azure Speech Service 金鑰，語音功能將不可用")
+        SPEECH_AVAILABLE = False
+except Exception as e:
+    print(f"Azure Speech Service 初始化失敗: {e}")
+    SPEECH_AVAILABLE = False
+
+# --- 初始化圖片處理器 ---
+try:
+    if LLM_AVAILABLE:
+        init_image_processor(llm_model)
+        IMAGE_AVAILABLE = True
+        print("圖片處理器初始化成功！")
+    else:
+        print("LLM 不可用，圖片功能將不可用")
+        IMAGE_AVAILABLE = False
+except Exception as e:
+    print(f"圖片處理器初始化失敗: {e}")
+    IMAGE_AVAILABLE = False
 
 # --- 載入提示模板 ---
 def load_prompt_template():
@@ -273,11 +308,15 @@ def handle_choice_stage(user_id, user_message):
 def handle_feedback_stage(user_id, user_message):
     """處理反饋階段的訊息"""
     # 檢查是否要重新開始或詢問新的料理
-    if any(keyword in user_message for keyword in ['謝謝', '好的', '了解', '重新開始', '重新']):
+    if any(keyword in user_message for keyword in ['謝謝', '好的', '了解', '重新開始', '重新', '換']):
         conversation_state.update_user_state(user_id, {
             'stage': 'idle'
         })
         return "好的！讓我們重新開始。請告訴我您有哪些食材，我會為您推薦適合的料理！"
+    
+    # 檢查是否是缺少/沒有/替代等關鍵字 - 繼續針對同一個料理給替代建議
+    if any(keyword in user_message for keyword in ['沒有', '缺少', '替代']):
+        return generate_alternatives_with_llm(user_id, user_message)
     
     # 檢查是否包含新的食材資訊
     ingredients = extract_ingredients(user_message)
@@ -311,6 +350,16 @@ def handle_feedback_stage(user_id, user_message):
 
 def is_recipe_related(message):
     """檢查訊息是否與食譜相關"""
+    # 快速檢查：如果是數字選擇（1、2、3），直接返回 True
+    import re
+    if re.match(r'^[123]$', message.strip()):
+        return True
+    
+    # 快速檢查：如果是替代方案相關詞彙，直接返回 True
+    alternative_keywords = ['沒有', '缺少', '替代', '換', '其他', '重新選擇', '換一個', '其他選項']
+    if any(keyword in message for keyword in alternative_keywords):
+        return True
+    
     # 如果 LLM 不可用，直接返回 True 讓系統處理
     if not LLM_AVAILABLE:
         return True
@@ -476,7 +525,7 @@ def generate_recommendations_with_llm(user_id, ingredients):
 
 請選擇 1、2 或 3 來查看詳細食譜！
 
-注意：請保持專業和簡潔的回應風格，不要使用過於口語化或誇張的表達。"""
+注意：請保持專業和簡潔的回應風格。"""
 
         response = llm_model.generate_content(prompt)
         recommendations_text = response.text
@@ -514,22 +563,13 @@ def generate_recipe_details_with_llm(recipe):
     try:
         prompt = f"""請為「{recipe['name']}」提供詳細的食譜，包含：
 
-【食材準備】
-- 詳細的食材清單和份量
+食材清單和份量：
+[列出所需食材]
 
-【烹調時間】
-- 預估烹調時間
+烹調步驟：
+[步驟化說明]
 
-【難度等級】
-- 簡單/中等/困難
-
-【詳細步驟】
-- 步驟化的烹調說明
-
-【小技巧】
-- 烹調技巧和注意事項(言簡意賅，不要冗長)
-
-請用繁體中文回答，格式要清楚易讀。"""
+請用繁體中文回答，保持簡潔易讀。"""
 
         response = llm_model.generate_content(prompt)
         response_text = response.text
@@ -564,18 +604,7 @@ def generate_alternatives_with_llm(user_id, message):
 
 用戶已選擇的食譜：{selected_recipe.get('name', '未知料理')}
 
-請提供簡潔實用的替代方案建議：
-
-【替代方案】
-- 如果食材不重要，直接說「可以不用」並說明理由
-- 如果食材重要，提供 1-2 個簡單的替代選項
-- 說明替代後的口感變化（簡短）
-
-【實用建議】
-- 給出具體的烹調調整建議
-- 鼓勵簡化版本
-
-請用繁體中文回答，保持簡潔，避免冗長的格式標題。重點是讓用戶快速了解可以怎麼做。"""
+請提供簡潔的替代方案建議，直接說明可以如何替代或調整，不要使用標題格式。"""
 
         response = llm_model.generate_content(prompt)
         response_text = response.text
@@ -638,14 +667,14 @@ def callback():
         abort(400)
     return 'OK'
 
-# --- 訊息處理 ---
+# --- 文字訊息處理 ---
 @handler.add(MessageEvent, message=TextMessageContent)
-def handle_message(event):
+def handle_text_message(event):
     user_id = event.source.user_id
     user_message = event.message.text
     
     # 記錄用戶訊息
-    logging.info(f"收到來自用戶 {user_id} 的訊息: {user_message}")
+    logging.info(f"收到來自用戶 {user_id} 的文字訊息: {user_message}")
     
     # 使用多輪對話處理
     ai_response = handle_conversation(user_id, user_message)
@@ -676,6 +705,266 @@ def handle_message(event):
             )
         )
 
+# --- 語音訊息處理 ---
+@handler.add(MessageEvent, message=AudioMessageContent)
+def handle_audio_message(event):
+    user_id = event.source.user_id
+    message_id = event.message.id
+    
+    # 記錄用戶訊息
+    logging.info(f"收到來自用戶 {user_id} 的語音訊息: {message_id}")
+    print(f"🎤 收到語音訊息: 用戶 {user_id}, 訊息 ID {message_id}")
+    
+    try:
+        # 檢查語音處理器是否可用
+        if not SPEECH_AVAILABLE:
+            error_response = "抱歉，語音處理功能目前無法使用，請改用文字輸入。"
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        replyToken=event.reply_token,
+                        messages=[TextMessage(text=error_response)],
+                        notificationDisabled=False
+                    )
+                )
+            return
+        
+        # 獲取語音內容（修正：用 MessagingApiBlob）
+        print(f"🔍 開始下載語音內容: {message_id}")
+        with ApiClient(configuration) as api_client:
+            blob_api = MessagingApiBlob(api_client)
+            try:
+                content = blob_api.get_message_content(message_id)
+                print(f"✅ 成功獲取語音內容，長度: {len(content)} bytes")
+            except Exception as download_error:
+                print(f"❌ 語音下載失敗: {download_error}")
+                logging.error(f"語音下載失敗: {download_error}")
+                raise download_error
+            
+            # 建立暫存檔案
+            temp_dir = "temp_files"
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"{user_id}_audio_{message_id}.m4a")
+            print(f"💾 開始寫入語音暫存檔案: {temp_file}")
+            try:
+                with open(temp_file, 'wb') as f:
+                    f.write(content)
+                print(f"✅ 語音檔案寫入成功")
+            except Exception as write_error:
+                print(f"❌ 語音檔案寫入失敗: {write_error}")
+                logging.error(f"語音檔案寫入失敗: {write_error}")
+                raise write_error
+        
+        # 使用語音處理器轉文字
+        speech_processor = get_speech_processor()
+        if speech_processor:
+            text = speech_processor.process_line_audio(temp_file)
+            
+            # 清理暫存檔案
+            try:
+                os.remove(temp_file)
+            except Exception as e:
+                logging.warning(f"清理語音暫存檔案失敗: {e}")
+            
+            if text:
+                # 語音轉文字成功，直接使用現有對話邏輯處理（不顯示識別結果）
+                ai_response = handle_conversation(user_id, text)
+                
+                # 儲存到資料庫
+                try:
+                    recipe = Recipe(
+                        user_id=user_id,
+                        user_message=f"語音訊息: {text}",
+                        recipe_title="語音識別回應",
+                        recipe_content=ai_response,
+                        ingredients="語音識別",
+                        cooking_time="測試時間",
+                        difficulty="簡單"
+                    )
+                    save_recipe(recipe)
+                except Exception as e:
+                    logging.error(f"儲存食譜時發生錯誤: {e}")
+                
+                # 回傳給用戶
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            replyToken=event.reply_token,
+                            messages=[TextMessage(text=ai_response)],
+                            notificationDisabled=False
+                        )
+                    )
+            else:
+                # 語音識別失敗
+                error_response = "抱歉，我無法識別您的語音內容。請改用文字輸入，例如：「我有雞蛋、白飯、蔥，想做蛋炒飯」"
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            replyToken=event.reply_token,
+                            messages=[TextMessage(text=error_response)],
+                            notificationDisabled=False
+                        )
+                    )
+        else:
+            # 語音處理器不可用
+            error_response = "抱歉，語音處理功能目前無法使用，請改用文字輸入。"
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        replyToken=event.reply_token,
+                        messages=[TextMessage(text=error_response)],
+                        notificationDisabled=False
+                    )
+                )
+        
+    except Exception as e:
+        logging.error(f"處理語音訊息時發生錯誤: {e}")
+        error_response = "抱歉，處理您的語音時發生錯誤，請改用文字輸入。"
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    replyToken=event.reply_token,
+                    messages=[TextMessage(text=error_response)],
+                    notificationDisabled=False
+                )
+            )
+
+# --- 圖片訊息處理 ---
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    user_id = event.source.user_id
+    message_id = event.message.id
+    
+    # 記錄用戶訊息
+    logging.info(f"收到來自用戶 {user_id} 的圖片訊息: {message_id}")
+    print(f"📷 收到圖片訊息: 用戶 {user_id}, 訊息 ID {message_id}")
+    
+    try:
+        # 檢查圖片處理器是否可用
+        if not IMAGE_AVAILABLE:
+            error_response = "抱歉，圖片處理功能目前無法使用，請改用文字輸入。"
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        replyToken=event.reply_token,
+                        messages=[TextMessage(text=error_response)],
+                        notificationDisabled=False
+                    )
+                )
+            return
+        
+        # 獲取圖片內容（修正：用 MessagingApiBlob）
+        print(f"🔍 開始下載圖片內容: {message_id}")
+        with ApiClient(configuration) as api_client:
+            blob_api = MessagingApiBlob(api_client)
+            try:
+                content = blob_api.get_message_content(message_id)
+                print(f"✅ 成功獲取圖片內容，長度: {len(content)} bytes")
+            except Exception as download_error:
+                print(f"❌ 圖片下載失敗: {download_error}")
+                logging.error(f"圖片下載失敗: {download_error}")
+                raise download_error
+            
+            # 建立暫存檔案
+            temp_dir = "temp_files"
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_file = os.path.join(temp_dir, f"{user_id}_image_{message_id}.jpg")
+            print(f"💾 開始寫入圖片暫存檔案: {temp_file}")
+            try:
+                with open(temp_file, 'wb') as f:
+                    f.write(content)
+                print(f"✅ 圖片檔案寫入成功")
+            except Exception as write_error:
+                print(f"❌ 圖片檔案寫入失敗: {write_error}")
+                logging.error(f"圖片檔案寫入失敗: {write_error}")
+                raise write_error
+        
+        # 使用圖片處理器分析
+        image_processor = get_image_processor()
+        if image_processor:
+            analysis_result = image_processor.analyze_fridge_image(temp_file)
+            
+            # 清理暫存檔案
+            try:
+                os.remove(temp_file)
+                logging.info(f"暫存檔案已清理: {temp_file}")
+            except Exception as e:
+                logging.warning(f"清理暫存檔案失敗: {e}")
+            
+            if analysis_result:
+                # 圖片分析成功，直接使用現有對話邏輯處理（不顯示識別結果）
+                print(f"✅ 圖片分析成功，回應長度: {len(analysis_result)} 字元")
+                ai_response = handle_conversation(user_id, analysis_result)
+                
+                # 儲存到資料庫
+                try:
+                    recipe = Recipe(
+                        user_id=user_id,
+                        user_message=f"圖片訊息: {message_id}",
+                        recipe_title="圖片識別回應",
+                        recipe_content=ai_response,
+                        ingredients="圖片識別",
+                        cooking_time="測試時間",
+                        difficulty="簡單"
+                    )
+                    save_recipe(recipe)
+                except Exception as e:
+                    logging.error(f"儲存食譜時發生錯誤: {e}")
+                
+                # 回傳給用戶
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            replyToken=event.reply_token,
+                            messages=[TextMessage(text=ai_response)],
+                            notificationDisabled=False
+                        )
+                    )
+            else:
+                # 圖片分析失敗
+                error_response = "抱歉，我無法識別圖片中的食材。請確保圖片清晰，或改用文字描述您的食材。"
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            replyToken=event.reply_token,
+                            messages=[TextMessage(text=error_response)],
+                            notificationDisabled=False
+                        )
+                    )
+        else:
+            # 圖片處理器不可用
+            error_response = "抱歉，圖片處理功能目前無法使用，請改用文字輸入。"
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        replyToken=event.reply_token,
+                        messages=[TextMessage(text=error_response)],
+                        notificationDisabled=False
+                    )
+                )
+        
+    except Exception as e:
+        logging.error(f"處理圖片訊息時發生錯誤: {e}")
+        error_response = "抱歉，處理您的圖片時發生錯誤，請改用文字輸入。"
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    replyToken=event.reply_token,
+                    messages=[TextMessage(text=error_response)],
+                    notificationDisabled=False
+                )
+            )
+
 # --- 健康檢查路由 ---
 @app.route("/health", methods=['GET'])
 def health_check():
@@ -685,7 +974,10 @@ def health_check():
         "recipe_count": recipe_count,
         "message": f"資料庫中有 {recipe_count} 個食譜記錄",
         "conversation_users": len(conversation_state.user_states),
-        "llm_available": LLM_AVAILABLE
+        "llm_available": LLM_AVAILABLE,
+        "speech_available": SPEECH_AVAILABLE,
+        "image_available": IMAGE_AVAILABLE,
+        "version": "1.0.0"
     })
 
 # --- 主程式 ---
@@ -693,7 +985,11 @@ if __name__ == "__main__":
     print("=== MomsHero LLM 多輪對話版本啟動 ===")
     print(f"資料庫中現有食譜數量: {get_recipe_count()}")
     print(f"LLM 可用狀態: {LLM_AVAILABLE}")
+    print(f"語音處理可用狀態: {SPEECH_AVAILABLE}")
+    print(f"圖片處理可用狀態: {IMAGE_AVAILABLE}")
     print("多輪對話功能已啟用，支援食材上傳、推薦選擇、詳細食譜、替代方案")
+    print("🎤 語音轉文字功能已啟用")
+    print("📷 圖片識別功能已啟用")
     print("健康檢查端點: http://localhost:5000/health")
     print("=" * 50)
     
