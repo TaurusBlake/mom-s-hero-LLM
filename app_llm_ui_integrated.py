@@ -1042,6 +1042,8 @@ def health_check():
 
 # --- 主程式 ---
 if __name__ == "__main__":
+    # 从环境变量 PORT 或 WEBSITES_PORT 读取端口，预设回退到 5000
+    port = int(os.environ.get("PORT", os.environ.get("WEBSITES_PORT", 5000)))
     print("=== MomsHero LLM UI 整合版啟動 ===")
     print(f"資料庫中現有食譜數量: {get_recipe_count()}")
     print(f"LLM 可用狀態: {LLM_AVAILABLE}")
@@ -1055,6 +1057,7 @@ if __name__ == "__main__":
     print("- ✅ 多輪對話支援")
     print("- 🎤 語音轉文字功能")
     print("- 📷 圖片食材識別功能")
-    print("健康檢查端點: http://localhost:5000/health")
+    print(f"健康檢查端點: http://localhost:{port}/health")
     print("=" * 50)
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+     # 监听所有网络接口与环境变量指定端口
+    app.run(debug=True, host='0.0.0.0', port=port)
